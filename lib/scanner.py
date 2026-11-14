@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from os import makedirs
 from os.path import dirname, join, realpath
+from re import compile as re_compile
 from time import monotonic, sleep
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -25,6 +26,8 @@ RESPONSE_OK = 0
 RESPONSE_TIMEOUT = 1
 RESPONSE_DISCONNECTED = 2
 RESPONSE_ERROR = -1
+
+_CL_VALUE_RE = re_compile(r'(?i)(Content-Length\s*:\s*)\d+')
 
 FINDING_CATEGORIES = {
     "CL.0": "cl0",
@@ -112,6 +115,7 @@ class SmugglerScanner:
 
     def _build_payload(self, template: str, content_length: int, body: str) -> Payload:
         host_value = self.config.vhost or self.config.host
+        template = _CL_VALUE_RE.sub(r'\g<1>__REPLACE_CL__', template)
         lines = [
             "__METHOD__ __ENDPOINT__?cb=__RANDOM__ HTTP/1.1",
             template,
@@ -243,10 +247,6 @@ class SmugglerScanner:
         result = analyzer.analyze(payload_a, victim)
         first = result.get("first_response")
         second = result.get("second_response")
-        if first is None:
-            first = result.get("first")
-        if second is None:
-            second = result.get("second")
         canary_hit = False
         for resp in (first, second):
             if isinstance(resp, bytes) and self.canary.validate(resp, canary):
@@ -276,7 +276,13 @@ class SmugglerScanner:
         return probe.run_all(self.config.endpoint, host_header)
 
     def _run_h2_probes(self) -> List[Dict[str, object]]:
-        from lib.h2_probes import H2DesyncProbe
+        try:
+            from lib.h2_probes import H2DesyncProbe
+        except ImportError:
+            if self.config.verbose:
+                print_info("h2", "h2 package not installed; skipping HTTP/2 probes",
+                           self.config.log_handle, Colors.YELLOW)
+            return []
         self._apply_rate_limit()
         probe = H2DesyncProbe(
             host=self.config.host, port=self.config.port,
@@ -649,8 +655,9 @@ class SmugglerScanner:
             body = END_CHUNK + smuggled
             content_length = len(body.encode("latin-1"))
         else:
-            body = f"{len(smuggled):x}\r\n{smuggled}0\r\n\r\n"
-            content_length = 4
+            size_line = f"{len(smuggled):x}\r\n"
+            body = size_line + smuggled + "\r\n0\r\n\r\n"
+            content_length = len(size_line.encode("latin-1"))
         payload = self._build_payload(template, content_length, body)
 
         hits = 0
