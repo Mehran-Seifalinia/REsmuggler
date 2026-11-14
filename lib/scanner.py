@@ -1,26 +1,24 @@
-"""Core differential desync scanner with multi-vector detection."""
-
 from dataclasses import dataclass
 from os import makedirs
 from os.path import dirname, join, realpath
 from time import monotonic, sleep
 from typing import Dict, List, Optional, Set, Tuple
 
-from lib.colors import Colors
-from lib.http_client import HTTPClient, RECV_DATA, RECV_TIMEOUT
-from lib.payloads import END_CHUNK, Payload
-from lib.ui import (clear_progress, filter_response, print_finding,
-                    print_info, print_progress, strip_ansi)
-from lib.canary_probes import CanaryProbe
-from lib.timing_detector import TimingDetector
-from lib.connection_analyzer import ConnectionAnalyzer
-from lib.h2c_probes import H2CProbe
-from lib.te0_probes import TEZeroProbe
-from lib.parser_discrepancy import ParserDiscrepancyEngine
-from lib.single_packet import SinglePacketAttack
-from lib.funky_chunks import funky_chunk_mutations, build_funky_payload
 from lib.canary import CanaryGenerator
+from lib.canary_probes import CanaryProbe
+from lib.colors import Colors
+from lib.connection_analyzer import ConnectionAnalyzer
+from lib.funky_chunks import build_funky_payload, funky_chunk_mutations
+from lib.h2c_probes import H2CProbe
+from lib.http_client import HTTPClient, RECV_DATA, RECV_TIMEOUT
 from lib.output_formatter import OutputFormatter
+from lib.parser_discrepancy import ParserDiscrepancyEngine
+from lib.payloads import END_CHUNK, Payload
+from lib.single_packet import SinglePacketAttack
+from lib.te0_probes import TEZeroProbe
+from lib.timing_detector import TimingDetector
+from lib.ui import (clear_progress, filter_response, print_finding,
+                    print_info, print_progress)
 
 
 RESPONSE_OK = 0
@@ -47,8 +45,8 @@ FINDING_CATEGORIES = {
     "PARSER_DISCREPANCY": "parser",
     "FUNKY_CHUNK": "funky",
     "CONNECTION_LOCKED": "connection_locked",
-    "CL.TE_TIMING": "timing",
-    "TE.CL_TIMING": "timing",
+    "CL.TE_TIMING": "timing_clte",
+    "TE.CL_TIMING": "timing_tecl",
 }
 
 
@@ -95,6 +93,7 @@ class SmugglerScanner:
         self.cookies: List[str] = []
         self._last_probe_at = 0.0
         self._seen_findings: Set[str] = set()
+        self._seen_heuristics: Set[str] = set()
         self.canary = CanaryGenerator()
         self.formatter = OutputFormatter(
             target=f"{config.host}:{config.port}{config.endpoint}",
@@ -317,6 +316,50 @@ class SmugglerScanner:
         clear_progress()
         return results
 
+    def _escalate_to_canary(self, kind: str) -> Tuple[bool, Dict[str, object]]:
+        probe = CanaryProbe(
+            host=self.config.host, port=self.config.port,
+            use_tls=self.config.use_tls, timeout=self.config.timeout,
+        )
+        host = self.config.vhost or self.config.host
+        endpoint = self.config.endpoint
+        fn = None
+        if kind in ("CL.TE", "CL.TE_TIMING"):
+            fn = probe.probe_clte
+        elif kind in ("TE.CL", "TE.CL_TIMING"):
+            fn = probe.probe_tecl
+        elif kind in ("CL.0", "SINGLE_PACKET_CL0", "CONNECTION_LOCKED"):
+            fn = probe.probe_cl0
+        elif kind == "0.CL":
+            fn = probe.probe_0cl
+        if fn is None:
+            return False, {}
+        last: Dict[str, object] = {}
+        for _ in range(2):
+            try:
+                last = fn(endpoint, host)
+            except OSError:
+                continue
+            if last.get("desync_suspected"):
+                return True, last
+        return False, last
+
+    def _escalate_to_single_packet(self, kind: str) -> Dict[str, object]:
+        attack = SinglePacketAttack(
+            host=self.config.host, port=self.config.port,
+            use_tls=self.config.use_tls, timeout=self.config.timeout,
+        )
+        host = self.config.vhost or self.config.host
+        endpoint = self.config.endpoint
+        try:
+            if kind in ("CL.TE", "CL.TE_TIMING"):
+                return attack.probe_pipeline_desync(endpoint, host)
+            if kind in ("CL.0", "SINGLE_PACKET_CL0"):
+                return attack.probe_cl0_pair(endpoint, host)
+        except OSError:
+            pass
+        return {}
+
     def scan(self, mutations: Dict[str, str]) -> int:
         findings = 0
 
@@ -330,30 +373,63 @@ class SmugglerScanner:
                 print_info("canary", "running canary probes",
                            self.config.log_handle, Colors.MAGENTA)
             for result in self._run_canary_probes():
+                kind = result.get("type", "CANARY")
                 if result.get("desync_suspected"):
                     if self._report_finding(
-                            result.get("type", "CANARY"),
-                            result.get("canary_path", "unknown"),
+                            kind, "canary_reflected",
                             raw_payload=result.get("raw"),
                             canary_path=result.get("canary_path", ""),
-                            confidence=result.get("confidence", 0.0)):
+                            confidence=result.get("confidence", 1.0)):
                         findings += 1
                         if self.config.exit_early:
                             return findings
+                elif result.get("needs_escalation"):
+                    ev = self._escalate_to_single_packet(kind)
+                    if ev.get("desync_suspected"):
+                        if self._report_finding(
+                                kind, "single_packet_escalated",
+                                raw_payload=ev.get("raw"),
+                                canary_path=ev.get("canary_path", ""),
+                                confidence=1.0):
+                            findings += 1
+                            if self.config.exit_early:
+                                return findings
+                    else:
+                        self._report_finding(
+                            kind, "canary_rejected",
+                            raw_payload=result.get("raw"),
+                            canary_path=result.get("canary_path", ""),
+                            confidence=result.get("confidence", 0.0),
+                            heuristic=True,
+                        )
 
         if self.config.test_timing:
             if self.config.verbose:
                 print_info("timing", "running timing probes",
                            self.config.log_handle, Colors.MAGENTA)
             for result in self._run_timing_probes():
-                if result.get("desync_suspected"):
+                if not result.get("desync_suspected"):
+                    continue
+                kind = result.get("type", "TIMING")
+                confirmed, evidence = self._escalate_to_canary(kind)
+                if confirmed:
+                    report_kind = kind.replace("_TIMING", "")
+                    if self._report_finding(
+                            report_kind, "timing_escalated",
+                            raw_payload=evidence.get("raw"),
+                            canary_path=evidence.get("canary_path", ""),
+                            confidence=1.0):
+                        findings += 1
+                        if self.config.exit_early:
+                            return findings
+                else:
                     attempts = result.get("attempts", 1) or 1
                     stalls = result.get("stalls", 0)
+                    fast = result.get("fast_rejects", 0)
                     self._report_finding(
-                        result.get("type", "TIMING"),
-                        "timing_desync",
+                        kind, "timing_desync",
                         raw_payload=result.get("raw"),
-                        confidence=stalls / attempts,
+                        confidence=max(stalls, fast) / attempts,
                         heuristic=True,
                     )
 
@@ -362,12 +438,29 @@ class SmugglerScanner:
                        self.config.log_handle, Colors.MAGENTA)
         for result in self._run_connection_analysis():
             if result.get("is_connection_locked"):
-                self._report_finding("CONNECTION_LOCKED",
-                                     "connection_locked_desync",
-                                     raw_payload=result.get("raw"),
-                                     canary_path=result.get("canary_path", ""),
-                                     confidence=0.5,
-                                     heuristic=True)
+                self._report_finding(
+                    "CONNECTION_LOCKED", "connection_locked_desync",
+                    raw_payload=result.get("raw"),
+                    canary_path=result.get("canary_path", ""),
+                    confidence=0.5, heuristic=True,
+                )
+            elif result.get("needs_escalation"):
+                confirmed, ev = self._escalate_to_canary("CL.0")
+                if confirmed:
+                    if self._report_finding(
+                            "CL.0", "connection_close_escalated",
+                            raw_payload=ev.get("raw"),
+                            canary_path=ev.get("canary_path", ""),
+                            confidence=1.0):
+                        findings += 1
+                        if self.config.exit_early:
+                            return findings
+                else:
+                    self._report_finding(
+                        "CONNECTION_LOCKED", "connection_close_signal",
+                        raw_payload=result.get("raw"),
+                        confidence=0.3, heuristic=True,
+                    )
 
         if self.config.test_h2c:
             if self.config.verbose:
@@ -419,32 +512,54 @@ class SmugglerScanner:
                 print_info("sp", "running single-packet probes",
                            self.config.log_handle, Colors.MAGENTA)
             for result in self._run_single_packet_probes():
+                kind = result.get("type", "SINGLE_PACKET")
                 if result.get("desync_suspected"):
                     if self._report_finding(
-                            result.get("type", "SINGLE_PACKET"),
-                            "pipeline_desync",
+                            kind, "pipeline_desync",
                             raw_payload=result.get("raw"),
                             canary_path=result.get("canary_path", ""),
                             confidence=1.0):
                         findings += 1
                         if self.config.exit_early:
                             return findings
+                elif result.get("needs_escalation"):
+                    confirmed, ev = self._escalate_to_canary(kind)
+                    if confirmed:
+                        if self._report_finding(
+                                kind, "canary_escalated",
+                                raw_payload=ev.get("raw"),
+                                canary_path=ev.get("canary_path", ""),
+                                confidence=1.0):
+                            findings += 1
+                            if self.config.exit_early:
+                                return findings
 
         if self.config.test_parser:
             if self.config.verbose:
                 print_info("pd", "running parser discrepancy probes",
                            self.config.log_handle, Colors.MAGENTA)
             for result in self._run_parser_probes():
+                kind = result.get("type", "unknown")
                 if result.get("discrepancy"):
                     if self._report_finding(
-                            "PARSER_DISCREPANCY",
-                            result.get("type", "unknown"),
+                            "PARSER_DISCREPANCY", kind,
                             raw_payload=result.get("raw"),
                             canary_path=result.get("canary_path", ""),
                             confidence=1.0):
                         findings += 1
                         if self.config.exit_early:
                             return findings
+                elif result.get("needs_escalation"):
+                    confirmed, ev = self._escalate_to_canary(kind)
+                    if confirmed:
+                        if self._report_finding(
+                                "PARSER_DISCREPANCY", f"{kind}_escalated",
+                                raw_payload=ev.get("raw"),
+                                canary_path=ev.get("canary_path", ""),
+                                confidence=1.0):
+                            findings += 1
+                            if self.config.exit_early:
+                                return findings
 
         if self.config.test_funky:
             if self.config.verbose:
@@ -532,15 +647,21 @@ class SmugglerScanner:
                         canary_path: str = "", confidence: float = 0.0,
                         heuristic: bool = False) -> bool:
         category = FINDING_CATEGORIES.get(kind, kind.lower())
-        if category in self._seen_findings:
-            return False
+        if heuristic:
+            key = f"heuristic:{category}"
+            if key in self._seen_heuristics:
+                return False
+            self._seen_heuristics.add(key)
+        else:
+            if category in self._seen_findings:
+                return False
+            self._seen_findings.add(category)
+
         scheme = "https" if self.config.use_tls else "http"
         target = f"{scheme}://{self.config.host}:{self.config.port}{self.config.endpoint}"
         print_finding(kind, name, target, confidence, heuristic,
                       self.config.log_handle)
-        self._seen_findings.add(category)
-        if heuristic:
-            return False
+
         raw: Optional[bytes] = None
         if payload is not None:
             raw = payload.render()
@@ -548,10 +669,11 @@ class SmugglerScanner:
             raw = raw_payload
         payload_str = raw.decode("latin-1", errors="replace") if raw else ""
         self.formatter.add_finding(kind, name, payload_str, target,
-                                   canary_path, confidence)
-        if raw is not None:
+                                   canary_path, confidence,
+                                   heuristic=heuristic)
+        if raw is not None and not heuristic:
             self._write_poc(kind, name, raw)
-        return True
+        return not heuristic
 
     def _write_poc(self, kind: str, name: str, raw: bytes) -> None:
         base = realpath(dirname(__file__) + "/..")
