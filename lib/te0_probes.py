@@ -1,6 +1,4 @@
-"""TE.0 detection: front-end ignores or misparses Transfer-Encoding."""
-
-from socket import (create_connection, socket, timeout as SocketTimeout)
+from socket import create_connection, socket, timeout as SocketTimeout
 from ssl import CERT_NONE, create_default_context
 from typing import Dict, List
 
@@ -59,28 +57,45 @@ class TEZeroProbe:
         ).encode("latin-1")
         hits = 0
         pipelined = 0
+        closed_after_prefix = 0
         attempts = 3
         for _ in range(attempts):
+            sock = None
             try:
-                sock = self._connect()
-                sock.sendall(prefix)
+                try:
+                    sock = self._connect()
+                except OSError:
+                    continue
+                try:
+                    sock.sendall(prefix)
+                except OSError:
+                    closed_after_prefix += 1
+                    continue
                 early = self._drain(sock)
                 if self.canary.validate(early, canary_path):
                     pipelined += 1
-                    sock.close()
                     continue
-                sock.sendall(victim)
+                try:
+                    sock.sendall(victim)
+                except OSError:
+                    closed_after_prefix += 1
+                    continue
                 late = self._drain(sock)
-                sock.close()
                 if self.canary.validate(late, canary_path):
                     hits += 1
-            except OSError:
-                pass
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
         return {
             "hits": hits,
             "attempts": attempts,
             "pipelined": pipelined,
+            "closed_after_prefix": closed_after_prefix,
             "desync_suspected": hits >= 2,
+            "needs_escalation": hits == 0 and closed_after_prefix >= 2,
             "raw": prefix,
         }
 
@@ -133,5 +148,6 @@ class TEZeroProbe:
                 results.append(fn(endpoint, host_header))
             except OSError:
                 results.append({"type": fn.__name__, "error": "connection_failed",
-                                "desync_suspected": False})
+                                "desync_suspected": False,
+                                "needs_escalation": False})
         return results
