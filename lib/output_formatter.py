@@ -1,7 +1,13 @@
+from csv import QUOTE_MINIMAL, writer as csv_writer
 from datetime import datetime, timezone
+from io import StringIO
 from json import dumps
 from typing import Dict, List
 from uuid import uuid4
+
+
+CSV_COLUMNS = ["kind", "name", "payload", "evidence", "canary_path",
+               "confidence", "heuristic", "timestamp"]
 
 
 class OutputFormatter:
@@ -47,20 +53,21 @@ class OutputFormatter:
         }, indent=2)
 
     def to_csv(self) -> str:
-        lines = ["kind,name,payload,evidence,canary_path,confidence,heuristic,timestamp"]
+        buf = StringIO()
+        writer = csv_writer(buf, quoting=QUOTE_MINIMAL, lineterminator="\n")
+        writer.writerow(CSV_COLUMNS)
         for f in self.findings:
-            row = [
+            writer.writerow([
                 f.get("kind", ""),
                 f.get("name", ""),
-                str(f.get("payload", "")).replace(",", ";"),
-                str(f.get("evidence", "")).replace(",", ";").replace("\n", " "),
+                f.get("payload", ""),
+                f.get("evidence", ""),
                 f.get("canary_path", ""),
-                str(f.get("confidence", 0.0)),
-                str(f.get("heuristic", False)),
+                f.get("confidence", 0.0),
+                f.get("heuristic", False),
                 f.get("timestamp", ""),
-            ]
-            lines.append(",".join(row))
-        return "\n".join(lines)
+            ])
+        return buf.getvalue()
 
     def exit_code(self) -> int:
         return 1 if any(not f.get("heuristic") for f in self.findings) else 0
@@ -99,10 +106,30 @@ class BatchOutputFormatter:
                 "total_findings": total,
                 "confirmed_findings": confirmed,
                 "heuristic_findings": heuristic,
-                "vulnerable_targets": sum(1 for t in self.targets if t["confirmed_count"] > 0),
+                "vulnerable_targets": sum(1 for t in self.targets
+                                          if t["confirmed_count"] > 0),
             },
             "targets": self.targets,
         }, indent=2)
+
+    def to_csv(self) -> str:
+        buf = StringIO()
+        writer = csv_writer(buf, quoting=QUOTE_MINIMAL, lineterminator="\n")
+        writer.writerow(["target"] + CSV_COLUMNS)
+        for t in self.targets:
+            for f in t["findings"]:
+                writer.writerow([
+                    t["target"],
+                    f.get("kind", ""),
+                    f.get("name", ""),
+                    f.get("payload", ""),
+                    f.get("evidence", ""),
+                    f.get("canary_path", ""),
+                    f.get("confidence", 0.0),
+                    f.get("heuristic", False),
+                    f.get("timestamp", ""),
+                ])
+        return buf.getvalue()
 
     def exit_code(self) -> int:
         return 1 if any(t["confirmed_count"] > 0 for t in self.targets) else 0
