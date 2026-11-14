@@ -139,12 +139,22 @@ def main() -> int:
                 scanner = SmugglerScanner(config)
                 if not scanner.prepare():
                     continue
-                findings = scanner.scan(MUTATION_PROFILES[args.config]())
-                print_info("result", f"{findings} finding(s)", log_handle,
-                           Colors.GREEN if findings == 0 else Colors.RED)
+                confirmed = scanner.scan(MUTATION_PROFILES[args.config]())
+                all_findings = scanner.get_findings()
+                heuristic_count = len(all_findings) - confirmed
+                if heuristic_count > 0:
+                    print_info(
+                        "result",
+                        f"{confirmed} confirmed, {heuristic_count} heuristic",
+                        log_handle,
+                        Colors.GREEN if confirmed == 0 else Colors.RED,
+                    )
+                else:
+                    print_info("result", f"{confirmed} finding(s)", log_handle,
+                               Colors.GREEN if confirmed == 0 else Colors.RED)
 
                 target_name = f"{'https' if use_tls else 'http'}://{host}:{port}{endpoint}"
-                batch.add_target(target_name, scanner.get_findings())
+                batch.add_target(target_name, all_findings)
         except KeyboardInterrupt:
             print()
             print_info("!", "interrupted by user", log_handle, Colors.YELLOW)
@@ -158,9 +168,27 @@ def main() -> int:
     elif args.csv:
         print(batch.to_csv())
 
-    total = sum(t["findings_count"] for t in batch.targets)
-    print_info("total", f"{total} finding(s)", None,
-               Colors.GREEN if total == 0 else Colors.RED)
+    confirmed_total = sum(t["confirmed_count"] for t in batch.targets)
+    heuristic_total = sum(t["heuristic_count"] for t in batch.targets)
+    if heuristic_total > 0:
+        print_info(
+            "total",
+            f"{confirmed_total} confirmed, {heuristic_total} heuristic",
+            None,
+            Colors.GREEN if confirmed_total == 0 else Colors.RED,
+        )
+    else:
+        print_info(
+            "total",
+            f"{confirmed_total} finding(s)",
+            None,
+            Colors.GREEN if confirmed_total == 0 else Colors.RED,
+        )
+
+    if not args.json and not args.csv and (confirmed_total + heuristic_total) > 0:
+        print_info("hint", "use -j for JSON or --csv for CSV output",
+                   None, Colors.GREY)
+
     return batch.exit_code()
 
 
