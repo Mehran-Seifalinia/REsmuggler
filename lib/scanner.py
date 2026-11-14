@@ -449,11 +449,20 @@ class SmugglerScanner:
                 else:
                     attempts = result.get("attempts", 1) or 1
                     stalls = result.get("stalls", 0)
+                    fast_rejects = result.get("fast_rejects", 0)
+                    baseline = result.get("baseline", 0.0)
+                    threshold = result.get("threshold", 0.0)
                     self._report_finding(
                         kind, "timing_desync",
                         raw_payload=result.get("raw"),
                         confidence=stalls / attempts,
                         heuristic=True,
+                        extra_evidence=(
+                            f"stalls={stalls}/{attempts} "
+                            f"fast_rejects={fast_rejects} "
+                            f"baseline={baseline:.3f}s "
+                            f"threshold={threshold:.3f}s"
+                        ),
                     )
 
         if self.config.verbose:
@@ -687,7 +696,8 @@ class SmugglerScanner:
     def _report_finding(self, kind: str, name: str, payload: Optional[Payload] = None,
                         raw_payload: Optional[bytes] = None,
                         canary_path: str = "", confidence: float = 0.0,
-                        heuristic: bool = False) -> bool:
+                        heuristic: bool = False,
+                        extra_evidence: Optional[str] = None) -> bool:
         category = FINDING_CATEGORIES.get(kind, kind.lower())
         if heuristic:
             key = f"heuristic:{category}"
@@ -710,14 +720,18 @@ class SmugglerScanner:
         elif raw_payload is not None:
             raw = raw_payload
         payload_str = raw.decode("latin-1", errors="replace") if raw else ""
-        self.formatter.add_finding(kind, name, payload_str, target,
+        evidence = extra_evidence if extra_evidence else target
+        self.formatter.add_finding(kind, name, payload_str, evidence,
                                    canary_path, confidence,
                                    heuristic=heuristic)
-        if raw is not None and not heuristic:
-            self._write_poc(kind, name, raw)
+        if raw is not None:
+            self._write_poc(kind, name, raw, heuristic=heuristic,
+                            confidence=confidence, evidence=evidence)
         return not heuristic
 
-    def _write_poc(self, kind: str, name: str, raw: bytes) -> None:
+    def _write_poc(self, kind: str, name: str, raw: bytes,
+                   heuristic: bool = False, confidence: float = 0.0,
+                   evidence: str = "") -> None:
         base = realpath(dirname(__file__) + "/..")
         out_dir = join(base, "payloads")
         makedirs(out_dir, exist_ok=True)
@@ -726,10 +740,33 @@ class SmugglerScanner:
         scheme = "https" if self.config.use_tls else "http"
         safe_kind = kind.replace(".", "_").replace("/", "_").replace("\\", "_")
         safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+        tag = "_heuristic" if heuristic else ""
         filename = join(out_dir,
-                        f"{scheme}_{host_tag}_{port_tag}_{safe_kind}_{safe_name}.txt")
+                        f"{scheme}_{host_tag}_{port_tag}_{safe_kind}_{safe_name}{tag}.txt")
+        target = f"{scheme}://{self.config.host}:{self.config.port}{self.config.endpoint}"
+        header_lines = [
+            f"# Kind: {kind}",
+            f"# Name: {name}",
+            f"# Heuristic: {heuristic}",
+            f"# Confidence: {confidence:.2f}",
+        ]
+        if evidence:
+            header_lines.append(f"# Evidence: {evidence}")
+        header_lines.extend([
+            f"# Target: {target}",
+            f"# Endpoint: {self.config.endpoint}",
+            f"# Method: {self.config.method}",
+            f"# Raw request bytes below. Reproduce with:",
+            f"#   openssl s_client -connect {self.config.host}:{self.config.port} -quiet < payload.txt"
+            if self.config.use_tls else
+            f"#   nc -v {self.config.host} {self.config.port} < payload.txt",
+            f"# Or paste into Burp Repeater with 'Update Content-Length' disabled.",
+            "# ---",
+            "",
+        ])
         try:
             with open(filename, "wb") as handle:
+                handle.write("\n".join(header_lines).encode("utf-8"))
                 handle.write(raw)
             if self.config.verbose:
                 print_info("poc", filename, self.config.log_handle, Colors.CYAN)
