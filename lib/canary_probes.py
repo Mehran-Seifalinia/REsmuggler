@@ -1,8 +1,9 @@
-from socket import create_connection, socket, IPPROTO_TCP, TCP_NODELAY, timeout as SocketTimeout
+from socket import (IPPROTO_TCP, TCP_NODELAY, create_connection, socket,
+                    timeout as SocketTimeout)
 from ssl import CERT_NONE, create_default_context
 from typing import Dict, List, Optional
 
-from lib.canary import CanaryGenerator
+from lib.canary import CanaryGenerator, _parse_status_line
 
 
 DRAIN_TIMEOUT = 0.6
@@ -53,14 +54,8 @@ class CanaryProbe:
     def _status_of(data: bytes) -> int:
         if not data:
             return -1
-        first = data.split(b"\r\n", 1)[0]
-        parts = first.split(b" ", 2)
-        if len(parts) < 2:
-            return -1
-        try:
-            return int(parts[1])
-        except ValueError:
-            return -1
+        status = _parse_status_line(data)
+        return status if status is not None else -1
 
     def _absorb_test(self, prefix: bytes, canary_path: str, endpoint: str,
                      host_header: str, repeat: int = 3) -> Dict[str, object]:
@@ -73,16 +68,23 @@ class CanaryProbe:
         hits = 0
         pipelined = 0
         closed_after_prefix = 0
+        valid_attempts = 0
         early_statuses: List[int] = []
         early_sample: Optional[bytes] = None
 
         for _ in range(repeat):
+            sock = None
             try:
-                sock = self._connect()
-            except OSError:
-                continue
-            try:
-                sock.sendall(prefix)
+                try:
+                    sock = self._connect()
+                except OSError:
+                    continue
+                valid_attempts += 1
+                try:
+                    sock.sendall(prefix)
+                except OSError:
+                    closed_after_prefix += 1
+                    continue
                 early = self._drain(sock)
                 status = self._status_of(early)
                 early_statuses.append(status)
@@ -99,22 +101,23 @@ class CanaryProbe:
                 late = self._drain(sock)
                 if self.canary.validate(late, canary_path):
                     hits += 1
-            except OSError:
-                pass
             finally:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
 
-        confidence = hits / repeat if repeat > 0 else 0.0
+        confidence = hits / valid_attempts if valid_attempts else 0.0
         reject_seen = any(400 <= s < 600 for s in early_statuses)
         needs_escalation = (
-            hits == 0 and (closed_after_prefix >= 2 or reject_seen)
+            hits == 0
+            and (closed_after_prefix >= 2 or reject_seen or pipelined >= 2)
         )
         return {
             "canary_path": canary_path,
             "hits": hits,
+            "valid_attempts": valid_attempts,
             "attempts": repeat,
             "pipelined": pipelined,
             "closed_after_prefix": closed_after_prefix,
@@ -216,5 +219,6 @@ class CanaryProbe:
                 results.append(fn(endpoint, host_header))
             except OSError:
                 results.append({"type": fn.__name__, "error": "connection_failed",
-                                "desync_suspected": False, "needs_escalation": False})
+                                "desync_suspected": False,
+                                "needs_escalation": False})
         return results
