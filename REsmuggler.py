@@ -56,6 +56,7 @@ def build_parser() -> ArgumentParser:
                         help="Show progress for every step")
     parser.add_argument("-l", "--log", help="Write a plaintext log to this file")
     parser.add_argument("-j", "--json", action="store_true", help="Output findings as JSON")
+    parser.add_argument("--csv", action="store_true", help="Output findings as CSV")
     parser.add_argument("--mutations", action="store_true",
                         help="Enable legacy mutation-loop testing")
     parser.add_argument("--no-canary", action="store_true",
@@ -154,6 +155,8 @@ def main() -> int:
 
     if args.json:
         print(batch.to_json())
+    elif args.csv:
+        print(batch.to_csv())
 
     total = sum(t["findings_count"] for t in batch.targets)
     print_info("total", f"{total} finding(s)", None,
