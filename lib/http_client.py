@@ -1,5 +1,4 @@
-from socket import (HAS_IPV6, create_connection, socket,
-                    timeout as SocketTimeout)
+from socket import create_connection, socket, timeout as SocketTimeout
 from ssl import CERT_NONE, HAS_ALPN, create_default_context
 from typing import List, Optional, Tuple
 
