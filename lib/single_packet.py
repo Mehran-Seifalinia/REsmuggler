@@ -1,9 +1,9 @@
-from socket import (create_connection, socket, IPPROTO_TCP, TCP_NODELAY,
+from socket import (IPPROTO_TCP, TCP_NODELAY, create_connection, socket,
                     timeout as SocketTimeout)
 from ssl import CERT_NONE, create_default_context
 from typing import Dict, List
 
-from lib.canary import CanaryGenerator
+from lib.canary import CanaryGenerator, split_http_responses, _parse_status_line
 
 try:
     from socket import TCP_CORK
@@ -13,52 +13,6 @@ except ImportError:
 
 
 DRAIN_TIMEOUT = 0.8
-MAX_RESPONSES = 6
-
-
-def _split_responses(blob: bytes) -> List[bytes]:
-    responses = []
-    remaining = blob
-    while remaining and len(responses) < MAX_RESPONSES:
-        idx = remaining.find(b"\r\n\r\n")
-        if idx < 0:
-            responses.append(remaining)
-            break
-        head = remaining[:idx]
-        body_need = 0
-        chunked = False
-        for line in head.split(b"\r\n"):
-            lower = line.lower()
-            if lower.startswith(b"content-length:"):
-                try:
-                    body_need = int(line.split(b":", 1)[1].strip())
-                except ValueError:
-                    body_need = 0
-            elif lower.startswith(b"transfer-encoding:") and b"chunked" in lower:
-                chunked = True
-        if chunked:
-            end = idx + 4
-            while end < len(remaining):
-                term = remaining.find(b"\r\n", end)
-                if term < 0:
-                    end = len(remaining)
-                    break
-                try:
-                    size = int(remaining[end:term].split(b";", 1)[0].strip(), 16)
-                except ValueError:
-                    end = len(remaining)
-                    break
-                end = term + 2 + size + 2
-                if size == 0:
-                    end += 2
-                    break
-            responses.append(remaining[:end])
-            remaining = remaining[end:]
-        else:
-            end = idx + 4 + body_need
-            responses.append(remaining[:end])
-            remaining = remaining[end:]
-    return responses
 
 
 class SinglePacketAttack:
@@ -118,12 +72,13 @@ class SinglePacketAttack:
         combined = req_a + req_b
         blob = b""
         closed = False
+        sock = None
         try:
-            sock = self._connect()
-        except OSError:
-            return {"response_count": 0, "responses": [], "raw": b"",
-                    "closed": True}
-        try:
+            try:
+                sock = self._connect()
+            except OSError:
+                return {"response_count": 0, "responses": [], "raw": b"",
+                        "closed": True}
             try:
                 sock.sendall(combined)
             except OSError:
@@ -132,53 +87,51 @@ class SinglePacketAttack:
                 self._uncork(sock)
                 blob = self._drain(sock)
         finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
-        responses = _split_responses(blob) if blob else []
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        responses = split_http_responses(blob) if blob else []
         return {"response_count": len(responses), "responses": responses,
                 "raw": blob, "closed": closed}
 
     @staticmethod
     def _parse_status(response: bytes) -> int:
-        first = response.split(b"\r\n", 1)[0]
-        parts = first.split(b" ", 2)
-        if len(parts) < 2:
-            return -1
-        try:
-            return int(parts[1])
-        except ValueError:
-            return -1
+        status = _parse_status_line(response)
+        return status if status is not None else -1
 
     @staticmethod
     def _classify(responses: List[bytes], canary_path: str,
                   canary: CanaryGenerator) -> Dict[str, object]:
-        if not responses:
+        filtered = [r for r in responses
+                    if not (100 <= (SinglePacketAttack._parse_status(r) or -1) < 200)]
+        if not filtered:
             return {"canary_hit": False, "desync_suspected": False,
                     "pipelines": 0, "response_count": 0,
-                    "front_end_reject": False, "needs_escalation": False}
-        flags = [canary.validate(r, canary_path) for r in responses]
+                    "front_end_reject": False, "needs_escalation": False,
+                    "statuses": []}
+        flags = [canary.validate(r, canary_path) for r in filtered]
         pipelines = sum(1 for f in flags[:-1] if f)
         victim_hit = bool(flags[-1]) if flags else False
-        statuses = [SinglePacketAttack._parse_status(r) for r in responses]
+        statuses = [SinglePacketAttack._parse_status(r) for r in filtered]
         victim_status = statuses[-1] if statuses else -1
         victim_is_error = 400 <= victim_status < 600
         desync = (
             victim_hit
             and pipelines == 0
-            and len(responses) == 2
+            and len(filtered) >= 2
             and victim_status > 0
             and not victim_is_error
         )
         front_end_reject = (
-            len(responses) == 1 and victim_is_error and not victim_hit
+            len(filtered) == 1 and victim_is_error and not victim_hit
         )
         return {
             "canary_hit": victim_hit,
             "desync_suspected": desync,
             "pipelines": pipelines,
-            "response_count": len(responses),
+            "response_count": len(filtered),
             "statuses": statuses,
             "front_end_reject": front_end_reject,
             "needs_escalation": front_end_reject and not desync,
