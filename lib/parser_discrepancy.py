@@ -1,5 +1,3 @@
-"""Parser discrepancy detection with pipelining-aware canary verification."""
-
 from socket import create_connection, socket, timeout as SocketTimeout
 from ssl import CERT_NONE, create_default_context
 from typing import Dict, List, Optional, Tuple
@@ -50,20 +48,57 @@ class ParserDiscrepancyEngine:
                 pass
         return data
 
-    def _exchange(self, prefix: bytes, victim: bytes) -> Tuple[bytes, bytes, bool]:
+    @staticmethod
+    def _status_of(data: bytes) -> int:
+        if not data:
+            return -1
+        first = data.split(b"\r\n", 1)[0]
+        parts = first.split(b" ", 2)
+        if len(parts) < 2:
+            return -1
+        try:
+            return int(parts[1])
+        except ValueError:
+            return -1
+
+    def _exchange(self, prefix: bytes, victim: bytes) -> Dict[str, object]:
         early = b""
         late = b""
-        pipelined = False
+        closed_after_prefix = False
+        early_status = -1
+        victim_status = -1
         try:
             sock = self._connect()
-            sock.sendall(prefix)
-            early = self._drain(sock)
-            sock.sendall(victim)
-            late = self._drain(sock)
-            sock.close()
         except OSError:
-            pass
-        return early, late, pipelined
+            return {"early": b"", "late": b"", "closed_after_prefix": True,
+                    "early_status": -1, "victim_status": -1}
+        try:
+            try:
+                sock.sendall(prefix)
+            except OSError:
+                return {"early": b"", "late": b"", "closed_after_prefix": True,
+                        "early_status": -1, "victim_status": -1}
+            early = self._drain(sock)
+            early_status = self._status_of(early)
+            try:
+                sock.sendall(victim)
+            except OSError:
+                closed_after_prefix = True
+            else:
+                late = self._drain(sock)
+                victim_status = self._status_of(late)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        return {
+            "early": early,
+            "late": late,
+            "closed_after_prefix": closed_after_prefix,
+            "early_status": early_status,
+            "victim_status": victim_status,
+        }
 
     def _common_probe(self, prefix: bytes, endpoint: str, host_header: str,
                       canary_path: str, label: str) -> Dict[str, object]:
@@ -72,16 +107,34 @@ class ParserDiscrepancyEngine:
             f"Host: {host_header}\r\n"
             f"\r\n"
         ).encode("latin-1")
-        early, late, _ = self._exchange(prefix, victim)
+        result = self._exchange(prefix, victim)
+        early = result["early"]
+        late = result["late"]
         early_hit = self.canary.validate(early, canary_path)
         late_hit = self.canary.validate(late, canary_path)
-        desync = late_hit and not early_hit
+        discrepancy = late_hit and not early_hit
+        early_status = result["early_status"]
+        victim_status = result["victim_status"]
+        victim_diverged = (
+            victim_status > 0
+            and early_status > 0
+            and victim_status != early_status
+        )
+        needs_escalation = (
+            not discrepancy
+            and (result["closed_after_prefix"] or victim_diverged)
+        )
         return {
             "type": label,
             "canary_path": canary_path,
             "early_hit": early_hit,
             "late_hit": late_hit,
-            "discrepancy": desync,
+            "discrepancy": discrepancy,
+            "closed_after_prefix": result["closed_after_prefix"],
+            "early_status": early_status,
+            "victim_status": victim_status,
+            "victim_diverged": victim_diverged,
+            "needs_escalation": needs_escalation,
             "raw": prefix,
         }
 
@@ -126,7 +179,8 @@ class ParserDiscrepancyEngine:
             f"\r\n"
             f"{smuggled}"
         ).encode("latin-1", errors="replace")
-        return self._common_probe(prefix, endpoint, host_header, canary_path, "DUPLICATE_CL")
+        return self._common_probe(prefix, endpoint, host_header, canary_path,
+                                  "DUPLICATE_CL")
 
     def run_all(self, endpoint: str, host_header: str) -> List[Dict[str, object]]:
         results = []
@@ -135,5 +189,5 @@ class ParserDiscrepancyEngine:
                 results.append(fn(endpoint, host_header))
             except OSError:
                 results.append({"type": fn.__name__, "error": "connection_failed",
-                                "discrepancy": False})
+                                "discrepancy": False, "needs_escalation": False})
         return results
