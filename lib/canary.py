@@ -52,10 +52,20 @@ def split_http_responses(blob: bytes) -> List[bytes]:
                 except ValueError:
                     end = len(remaining)
                     break
-                end = term + 2 + size + 2
                 if size == 0:
-                    end += 2
+                    scan = term + 2
+                    while scan < len(remaining):
+                        line_end = remaining.find(b"\r\n", scan)
+                        if line_end < 0:
+                            scan = len(remaining)
+                            break
+                        if line_end == scan:
+                            scan = line_end + 2
+                            break
+                        scan = line_end + 2
+                    end = scan
                     break
+                end = term + 2 + size + 2
             responses.append(remaining[:end])
             remaining = remaining[end:]
         else:
