@@ -144,6 +144,7 @@ class CanaryProbe:
             f"\r\n"
             f"{len(smuggled):x}\r\n"
             f"{smuggled}"
+            f"\r\n"
             f"0\r\n"
             f"\r\n"
         ).encode("latin-1", errors="replace")
