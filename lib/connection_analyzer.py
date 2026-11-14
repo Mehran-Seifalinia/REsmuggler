@@ -1,6 +1,8 @@
-from socket import create_connection, timeout as SocketTimeout
+from socket import create_connection, socket, timeout as SocketTimeout
 from ssl import CERT_NONE, create_default_context
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
+
+from lib.canary import _parse_status_line
 
 
 class ConnectionAnalyzer:
@@ -10,7 +12,7 @@ class ConnectionAnalyzer:
         self.use_tls = use_tls
         self.timeout = timeout
 
-    def _connect(self):
+    def _connect(self) -> socket:
         sock = create_connection((self.host, self.port), self.timeout)
         sock.settimeout(self.timeout)
         if self.use_tls:
@@ -24,22 +26,17 @@ class ConnectionAnalyzer:
     def _status_of(data: Optional[bytes]) -> int:
         if not data:
             return -1
-        first = data.split(b"\r\n", 1)[0]
-        parts = first.split(b" ", 2)
-        if len(parts) < 2:
-            return -1
-        try:
-            return int(parts[1])
-        except ValueError:
-            return -1
+        status = _parse_status_line(data)
+        return status if status is not None else -1
 
     def _send_single(self, payload: bytes) -> Tuple[Optional[bytes], bool]:
         closed = False
+        sock = None
         try:
-            sock = self._connect()
-        except OSError:
-            return None, True
-        try:
+            try:
+                sock = self._connect()
+            except OSError:
+                return None, True
             try:
                 sock.sendall(payload)
             except OSError:
@@ -53,23 +50,25 @@ class ConnectionAnalyzer:
                 closed = True
             return data, closed
         finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
     def _send_reused(self, payload_a: bytes, payload_b: bytes) -> Dict[str, object]:
         first: Optional[bytes] = None
         second: Optional[bytes] = None
         closed_before_second = False
         closed_after_second = False
+        sock = None
         try:
-            sock = self._connect()
-        except OSError:
-            return {"first": None, "second": None,
-                    "closed_before_second": True,
-                    "closed_after_second": True}
-        try:
+            try:
+                sock = self._connect()
+            except OSError:
+                return {"first": None, "second": None,
+                        "closed_before_second": True,
+                        "closed_after_second": True}
             try:
                 sock.sendall(payload_a)
             except OSError:
@@ -93,10 +92,11 @@ class ConnectionAnalyzer:
                     second = None
                     closed_after_second = True
         finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
         return {
             "first": first,
             "second": second,
@@ -142,6 +142,8 @@ class ConnectionAnalyzer:
             "separate_works": separate_ok,
             "reused_works": reused_ok,
             "second_response_received": second_ok,
+            "first_response": reused_first,
+            "second_response": reused_second,
             "first_status": first_status,
             "first_rejected": first_rejected,
             "separate_rejected": separate_rejected,
