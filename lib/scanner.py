@@ -27,7 +27,7 @@ RESPONSE_TIMEOUT = 1
 RESPONSE_DISCONNECTED = 2
 RESPONSE_ERROR = -1
 
-_CL_VALUE_RE = re_compile(r'(?i)(Content-Length\s*:\s*)\d+')
+_CL_VALUE_RE = re_compile(r"(?i)(Content-Length\s*:\s*)\d+")
 
 FINDING_CATEGORIES = {
     "CL.0": "cl0",
@@ -115,7 +115,7 @@ class SmugglerScanner:
 
     def _build_payload(self, template: str, content_length: int, body: str) -> Payload:
         host_value = self.config.vhost or self.config.host
-        template = _CL_VALUE_RE.sub(r'\g<1>__REPLACE_CL__', template)
+        template = _CL_VALUE_RE.sub(r"\g<1>__REPLACE_CL__", template)
         lines = [
             "__METHOD__ __ENDPOINT__?cb=__RANDOM__ HTTP/1.1",
             template,
@@ -423,14 +423,9 @@ class SmugglerScanner:
                             findings += 1
                             if self.config.exit_early:
                                 return findings
-                    else:
-                        self._report_finding(
-                            kind, "canary_rejected",
-                            raw_payload=result.get("raw"),
-                            canary_path=result.get("canary_path", ""),
-                            confidence=result.get("confidence", 0.0),
-                            heuristic=True,
-                        )
+                    elif self.config.verbose:
+                        print_info(kind, "canary rejected (no confirmation)",
+                                   self.config.log_handle, Colors.GREY)
 
         if self.config.test_timing:
             if self.config.verbose:
