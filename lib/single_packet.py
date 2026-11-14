@@ -1,5 +1,3 @@
-"""Single-packet attack with pipelining-aware desync confirmation."""
-
 from socket import (create_connection, socket, IPPROTO_TCP, TCP_NODELAY,
                     timeout as SocketTimeout)
 from ssl import CERT_NONE, create_default_context
@@ -119,16 +117,28 @@ class SinglePacketAttack:
     def send_pair(self, req_a: bytes, req_b: bytes) -> Dict[str, object]:
         combined = req_a + req_b
         blob = b""
+        closed = False
         try:
             sock = self._connect()
-            sock.sendall(combined)
-            self._uncork(sock)
-            blob = self._drain(sock)
-            sock.close()
         except OSError:
-            pass
+            return {"response_count": 0, "responses": [], "raw": b"",
+                    "closed": True}
+        try:
+            try:
+                sock.sendall(combined)
+            except OSError:
+                closed = True
+            else:
+                self._uncork(sock)
+                blob = self._drain(sock)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
         responses = _split_responses(blob) if blob else []
-        return {"response_count": len(responses), "responses": responses, "raw": blob}
+        return {"response_count": len(responses), "responses": responses,
+                "raw": blob, "closed": closed}
 
     @staticmethod
     def _parse_status(response: bytes) -> int:
@@ -146,7 +156,8 @@ class SinglePacketAttack:
                   canary: CanaryGenerator) -> Dict[str, object]:
         if not responses:
             return {"canary_hit": False, "desync_suspected": False,
-                    "pipelines": 0, "response_count": 0}
+                    "pipelines": 0, "response_count": 0,
+                    "front_end_reject": False, "needs_escalation": False}
         flags = [canary.validate(r, canary_path) for r in responses]
         pipelines = sum(1 for f in flags[:-1] if f)
         victim_hit = bool(flags[-1]) if flags else False
@@ -160,12 +171,17 @@ class SinglePacketAttack:
             and victim_status > 0
             and not victim_is_error
         )
+        front_end_reject = (
+            len(responses) == 1 and victim_is_error and not victim_hit
+        )
         return {
             "canary_hit": victim_hit,
             "desync_suspected": desync,
             "pipelines": pipelines,
             "response_count": len(responses),
             "statuses": statuses,
+            "front_end_reject": front_end_reject,
+            "needs_escalation": front_end_reject and not desync,
         }
 
     def probe_pipeline_desync(self, endpoint: str, host_header: str) -> Dict[str, object]:
@@ -230,5 +246,6 @@ class SinglePacketAttack:
                 results.append(fn(endpoint, host_header))
             except OSError:
                 results.append({"type": fn.__name__, "error": "connection_failed",
-                                "desync_suspected": False})
+                                "desync_suspected": False,
+                                "needs_escalation": False})
         return results
