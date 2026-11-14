@@ -199,6 +199,7 @@ class SmugglerScanner:
             return False
 
     def _run_canary_probes(self) -> List[Dict[str, object]]:
+        self._apply_rate_limit()
         probe = CanaryProbe(
             host=self.config.host, port=self.config.port,
             use_tls=self.config.use_tls, timeout=self.config.timeout,
@@ -208,6 +209,7 @@ class SmugglerScanner:
                              include_cl0=self.config.test_cl0)
 
     def _run_timing_probes(self) -> List[Dict[str, object]]:
+        self._apply_rate_limit()
         detector = TimingDetector(
             host=self.config.host, port=self.config.port,
             use_tls=self.config.use_tls, timeout=self.config.timeout,
@@ -216,6 +218,7 @@ class SmugglerScanner:
         return detector.run_all(self.config.endpoint, host_header)
 
     def _run_connection_analysis(self) -> List[Dict[str, object]]:
+        self._apply_rate_limit()
         analyzer = ConnectionAnalyzer(
             host=self.config.host, port=self.config.port,
             use_tls=self.config.use_tls, timeout=self.config.timeout,
@@ -238,11 +241,24 @@ class SmugglerScanner:
             f"Host: {host_header}\r\n\r\n"
         ).encode("latin-1")
         result = analyzer.analyze(payload_a, victim)
+        first = result.get("first_response")
+        second = result.get("second_response")
+        if first is None:
+            first = result.get("first")
+        if second is None:
+            second = result.get("second")
+        canary_hit = False
+        for resp in (first, second):
+            if isinstance(resp, bytes) and self.canary.validate(resp, canary):
+                canary_hit = True
+                break
         result["canary_path"] = canary
+        result["canary_hit"] = canary_hit
         result["raw"] = payload_a
         return [result]
 
     def _run_h2c_probes(self) -> List[Dict[str, object]]:
+        self._apply_rate_limit()
         probe = H2CProbe(
             host=self.config.host, port=self.config.port,
             use_tls=self.config.use_tls, timeout=self.config.timeout,
@@ -251,6 +267,7 @@ class SmugglerScanner:
         return probe.run_all(self.config.endpoint, host_header)
 
     def _run_te0_probes(self) -> List[Dict[str, object]]:
+        self._apply_rate_limit()
         probe = TEZeroProbe(
             host=self.config.host, port=self.config.port,
             use_tls=self.config.use_tls, timeout=self.config.timeout,
@@ -260,6 +277,7 @@ class SmugglerScanner:
 
     def _run_h2_probes(self) -> List[Dict[str, object]]:
         from lib.h2_probes import H2DesyncProbe
+        self._apply_rate_limit()
         probe = H2DesyncProbe(
             host=self.config.host, port=self.config.port,
             use_tls=self.config.use_tls, timeout=self.config.timeout,
@@ -268,6 +286,7 @@ class SmugglerScanner:
         return probe.run_all(self.config.endpoint, host_header)
 
     def _run_parser_probes(self) -> List[Dict[str, object]]:
+        self._apply_rate_limit()
         engine = ParserDiscrepancyEngine(
             host=self.config.host, port=self.config.port,
             use_tls=self.config.use_tls, timeout=self.config.timeout,
@@ -276,6 +295,7 @@ class SmugglerScanner:
         return engine.run_all(self.config.endpoint, host_header)
 
     def _run_single_packet_probes(self) -> List[Dict[str, object]]:
+        self._apply_rate_limit()
         attack = SinglePacketAttack(
             host=self.config.host, port=self.config.port,
             use_tls=self.config.use_tls, timeout=self.config.timeout,
@@ -292,7 +312,6 @@ class SmugglerScanner:
             canary_path = self.canary.new_path()
             raw = build_funky_payload(mutation, self.config.endpoint,
                                       host_header, canary_path)
-            status = -1
             hit = False
             try:
                 self._apply_rate_limit()
@@ -300,11 +319,13 @@ class SmugglerScanner:
                     host=self.config.host, port=self.config.port,
                     use_tls=self.config.use_tls, timeout=self.config.timeout,
                 )
-                client.connect()
-                client.send(raw)
-                status, data = client.receive_full()
-                client.close()
-                hit = self.canary.validate(data, canary_path)
+                try:
+                    client.connect()
+                    client.send(raw)
+                    status, data = client.receive_full()
+                    hit = bool(data and self.canary.validate(data, canary_path))
+                finally:
+                    client.close()
             except OSError:
                 pass
             if self.config.verbose:
@@ -312,7 +333,7 @@ class SmugglerScanner:
                                "VULN" if hit else "clean",
                                Colors.RED if hit else Colors.GREEN)
             results.append({"name": name, "canary_path": canary_path,
-                            "vulnerable": hit, "status": status, "raw": raw})
+                            "vulnerable": hit, "raw": raw})
         clear_progress()
         return results
 
@@ -336,6 +357,7 @@ class SmugglerScanner:
             return False, {}
         last: Dict[str, object] = {}
         for _ in range(2):
+            self._apply_rate_limit()
             try:
                 last = fn(endpoint, host)
             except OSError:
@@ -351,6 +373,7 @@ class SmugglerScanner:
         )
         host = self.config.vhost or self.config.host
         endpoint = self.config.endpoint
+        self._apply_rate_limit()
         try:
             if kind in ("CL.TE", "CL.TE_TIMING"):
                 return attack.probe_pipeline_desync(endpoint, host)
@@ -425,11 +448,10 @@ class SmugglerScanner:
                 else:
                     attempts = result.get("attempts", 1) or 1
                     stalls = result.get("stalls", 0)
-                    fast = result.get("fast_rejects", 0)
                     self._report_finding(
                         kind, "timing_desync",
                         raw_payload=result.get("raw"),
-                        confidence=max(stalls, fast) / attempts,
+                        confidence=stalls / attempts,
                         heuristic=True,
                     )
 
@@ -437,12 +459,21 @@ class SmugglerScanner:
             print_info("conn", "analyzing connection reuse",
                        self.config.log_handle, Colors.MAGENTA)
         for result in self._run_connection_analysis():
-            if result.get("is_connection_locked"):
+            if result.get("is_connection_locked") and result.get("canary_hit"):
+                if self._report_finding(
+                        "CONNECTION_LOCKED", "connection_locked_desync",
+                        raw_payload=result.get("raw"),
+                        canary_path=result.get("canary_path", ""),
+                        confidence=1.0):
+                    findings += 1
+                    if self.config.exit_early:
+                        return findings
+            elif result.get("is_connection_locked"):
                 self._report_finding(
-                    "CONNECTION_LOCKED", "connection_locked_desync",
+                    "CONNECTION_LOCKED", "connection_locked_signal",
                     raw_payload=result.get("raw"),
                     canary_path=result.get("canary_path", ""),
-                    confidence=0.5, heuristic=True,
+                    confidence=0.3, heuristic=True,
                 )
             elif result.get("needs_escalation"):
                 confirmed, ev = self._escalate_to_canary("CL.0")
@@ -469,7 +500,7 @@ class SmugglerScanner:
             for result in self._run_h2c_probes():
                 if result.get("desync_suspected"):
                     if self._report_finding(
-                            result.get("type", "H2C"), "h2c_upgrade",
+                            result.get("type", "H2C"), "h2c_smuggle",
                             raw_payload=result.get("raw"),
                             canary_path=result.get("canary_path", ""),
                             confidence=1.0):
@@ -491,6 +522,17 @@ class SmugglerScanner:
                         findings += 1
                         if self.config.exit_early:
                             return findings
+                elif result.get("needs_escalation"):
+                    confirmed, ev = self._escalate_to_canary("CL.0")
+                    if confirmed:
+                        if self._report_finding(
+                                "CL.0", "te0_escalated",
+                                raw_payload=ev.get("raw"),
+                                canary_path=ev.get("canary_path", ""),
+                                confidence=1.0):
+                            findings += 1
+                            if self.config.exit_early:
+                                return findings
 
         if h2_supported and self.config.test_h2:
             if self.config.verbose:
@@ -567,14 +609,12 @@ class SmugglerScanner:
                            self.config.log_handle, Colors.MAGENTA)
             for result in self._run_funky_chunks():
                 if result.get("vulnerable"):
-                    if self._report_finding(
-                            "FUNKY_CHUNK", result.get("name", "unknown"),
-                            raw_payload=result.get("raw"),
-                            canary_path=result.get("canary_path", ""),
-                            confidence=1.0):
-                        findings += 1
-                        if self.config.exit_early:
-                            return findings
+                    self._report_finding(
+                        "FUNKY_CHUNK", result.get("name", "unknown"),
+                        raw_payload=result.get("raw"),
+                        canary_path=result.get("canary_path", ""),
+                        confidence=0.5, heuristic=True,
+                    )
 
         if self.config.test_mutations:
             for name, template in mutations.items():
