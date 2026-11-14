@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Smuggler - HTTP Request Smuggling scanner with canary verification."""
-
 from argparse import ArgumentParser
 from sys import exit as sys_exit, stdin, version_info
 from urllib.parse import urlparse
@@ -16,11 +14,20 @@ MINIMUM_PYTHON = (3, 8)
 
 
 def parse_target(url: str):
-    if not url.lower().startswith(("http://", "https://")):
+    if not url or not url.strip():
+        raise ValueError("empty target URL")
+    url = url.strip()
+    if "://" in url:
+        scheme = url.split("://", 1)[0].lower()
+        if scheme not in ("http", "https"):
+            raise ValueError(f"unsupported scheme: {scheme}")
+    else:
         url = "https://" + url
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"unsupported scheme: {parsed.scheme}")
+    if not parsed.hostname:
+        raise ValueError("missing host")
     use_tls = parsed.scheme == "https"
     port = parsed.port or (443 if use_tls else 80)
     endpoint = parsed.path or "/"
