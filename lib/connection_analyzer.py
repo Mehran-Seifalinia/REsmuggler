@@ -1,8 +1,6 @@
-"""Distinguishes connection-locked smuggling from normal pipelining."""
-
-from socket import create_connection
+from socket import create_connection, timeout as SocketTimeout
 from ssl import CERT_NONE, create_default_context
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 class ConnectionAnalyzer:
@@ -22,52 +20,106 @@ class ConnectionAnalyzer:
             sock = ctx.wrap_socket(sock, server_hostname=self.host)
         return sock
 
-    def _send_single(self, payload: bytes) -> Optional[bytes]:
+    @staticmethod
+    def _status_of(data: Optional[bytes]) -> int:
+        if not data:
+            return -1
+        first = data.split(b"\r\n", 1)[0]
+        parts = first.split(b" ", 2)
+        if len(parts) < 2:
+            return -1
+        try:
+            return int(parts[1])
+        except ValueError:
+            return -1
+
+    def _send_single(self, payload: bytes) -> Tuple[Optional[bytes], bool]:
+        closed = False
         try:
             sock = self._connect()
-            sock.sendall(payload)
+        except OSError:
+            return None, True
+        try:
+            try:
+                sock.sendall(payload)
+            except OSError:
+                return None, True
             try:
                 data = sock.recv(65535)
+            except SocketTimeout:
+                data = None
             except OSError:
                 data = None
-            sock.close()
-            return data
-        except OSError:
-            return None
+                closed = True
+            return data, closed
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
-    def _send_reused(self, payload_a: bytes, payload_b: bytes) -> Tuple[Optional[bytes], Optional[bytes]]:
-        first = None
-        second = None
+    def _send_reused(self, payload_a: bytes, payload_b: bytes) -> Dict[str, object]:
+        first: Optional[bytes] = None
+        second: Optional[bytes] = None
+        closed_before_second = False
+        closed_after_second = False
         try:
             sock = self._connect()
-            sock.sendall(payload_a)
+        except OSError:
+            return {"first": None, "second": None,
+                    "closed_before_second": True,
+                    "closed_after_second": True}
+        try:
+            try:
+                sock.sendall(payload_a)
+            except OSError:
+                return {"first": None, "second": None,
+                        "closed_before_second": True,
+                        "closed_after_second": True}
             try:
                 first = sock.recv(65535)
-            except OSError:
+            except (SocketTimeout, OSError):
                 first = None
-            sock.sendall(payload_b)
             try:
-                second = sock.recv(65535)
+                sock.sendall(payload_b)
             except OSError:
-                second = None
-            sock.close()
-        except OSError:
-            pass
-        return first, second
+                closed_before_second = True
+            else:
+                try:
+                    second = sock.recv(65535)
+                except SocketTimeout:
+                    second = None
+                except OSError:
+                    second = None
+                    closed_after_second = True
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        return {
+            "first": first,
+            "second": second,
+            "closed_before_second": closed_before_second,
+            "closed_after_second": closed_after_second,
+        }
 
     def analyze(self, payload_a: bytes, payload_b: bytes) -> Dict[str, object]:
-        """Classify behavior: normal pipelining, connection-locked, or clean.
+        separate, separate_closed = self._send_single(payload_a)
+        reused = self._send_reused(payload_a, payload_b)
 
-        Per James Kettle's research, if a PoC only works on a reused
-        connection, it is probably a false positive unless it is a
-        connection-locked vulnerability.
-        """
-        separate = self._send_single(payload_a)
-        reused_first, reused_second = self._send_reused(payload_a, payload_b)
+        reused_first = reused["first"]
+        reused_second = reused["second"]
 
         separate_ok = separate is not None and len(separate) > 0
         reused_ok = reused_first is not None and len(reused_first) > 0
         second_ok = reused_second is not None and len(reused_second) > 0
+
+        first_status = self._status_of(reused_first)
+        first_rejected = 400 <= first_status < 600
+        closed_before_second = bool(reused["closed_before_second"])
+        closed_after_second = bool(reused["closed_after_second"])
+        separate_rejected = 400 <= self._status_of(separate) < 600
 
         if separate_ok and not reused_ok:
             classification = "normal_single"
@@ -75,18 +127,32 @@ class ConnectionAnalyzer:
             classification = "connection_locked"
         elif separate_ok and reused_ok and second_ok:
             classification = "normal_pipelining"
+        elif reused_ok and closed_before_second:
+            classification = "connection_closed_after_response"
         else:
             classification = "inconclusive"
+
+        needs_escalation = (
+            classification in ("connection_closed_after_response", "inconclusive")
+            and (first_rejected or separate_rejected or closed_after_second)
+        )
 
         return {
             "classification": classification,
             "separate_works": separate_ok,
             "reused_works": reused_ok,
             "second_response_received": second_ok,
+            "first_status": first_status,
+            "first_rejected": first_rejected,
+            "separate_rejected": separate_rejected,
+            "closed_before_second": closed_before_second,
+            "closed_after_second": closed_after_second,
+            "separate_closed": separate_closed,
             "is_connection_locked": classification == "connection_locked",
             "is_normal_pipelining": classification == "normal_pipelining",
+            "needs_escalation": needs_escalation,
         }
 
     def is_connection_locked_desync(self, payload_a: bytes, payload_b: bytes) -> bool:
         result = self.analyze(payload_a, payload_b)
-        return result.get("is_connection_locked", False)
+        return bool(result.get("is_connection_locked", False))
