@@ -48,14 +48,17 @@ def print_finding(kind: str, name: str, target: str,
     if heuristic:
         marker = f"{Colors.YELLOW}?{Colors.RESET}"
         label = f"{Colors.YELLOW}{kind}{Colors.RESET} {Colors.DIM}heuristic{Colors.RESET}"
+        metric = (f"  {Colors.GREY}score={confidence:.2f}{Colors.RESET}"
+                  if confidence > 0 else "")
     else:
         marker = f"{Colors.RED}●{Colors.RESET}"
         label = f"{Colors.BRIGHT}{Colors.RED}{kind}{Colors.RESET}"
-    conf = f"  {Colors.GREY}conf={confidence:.2f}{Colors.RESET}" if confidence > 0 else ""
+        metric = (f"  {Colors.GREY}conf={confidence:.2f}{Colors.RESET}"
+                  if confidence > 0 else "")
     line = (
         f"  {marker} {label}  "
         f"{Colors.CYAN}{name}{Colors.RESET}  "
-        f"{Colors.GREY}{target}{Colors.RESET}{conf}"
+        f"{Colors.GREY}{target}{Colors.RESET}{metric}"
     )
     stdout.write(line + "\n")
     stdout.flush()
