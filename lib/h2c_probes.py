@@ -1,8 +1,6 @@
-"""H2C cleartext upgrade smuggling detection."""
-
 from socket import create_connection, socket
 from ssl import CERT_NONE, create_default_context
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from lib.canary import CanaryGenerator
 
@@ -25,6 +23,43 @@ class H2CProbe:
             sock = ctx.wrap_socket(sock, server_hostname=self.host)
         return sock
 
+    def _send_recv(self, request: bytes) -> Optional[bytes]:
+        sock = None
+        data: Optional[bytes] = None
+        try:
+            try:
+                sock = self._connect()
+            except OSError:
+                return None
+            try:
+                sock.sendall(request)
+            except OSError:
+                return None
+            try:
+                data = sock.recv(65535)
+            except OSError:
+                data = None
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        return data
+
+    @staticmethod
+    def _is_switching_protocols(data: Optional[bytes]) -> bool:
+        if not data:
+            return False
+        head = data.split(b"\r\n", 1)[0]
+        parts = head.split(b" ", 2)
+        if len(parts) < 2:
+            return False
+        try:
+            return int(parts[1]) == 101
+        except ValueError:
+            return False
+
     def probe_h2c_upgrade(self, endpoint: str, host_header: str) -> Dict[str, object]:
         request = (
             f"GET {endpoint} HTTP/1.1\r\n"
@@ -34,24 +69,15 @@ class H2CProbe:
             f"HTTP2-Settings: AAMAAABkAAQAAP__\r\n"
             f"\r\n"
         ).encode("latin-1")
-
-        try:
-            sock = self._connect()
-            sock.sendall(request)
-            try:
-                data = sock.recv(65535)
-            except OSError:
-                data = None
-            sock.close()
-        except OSError:
-            data = None
-
-        upgraded = data is not None and b"101" in data and b"Switching Protocols" in data
+        data = self._send_recv(request)
+        upgraded = self._is_switching_protocols(data)
         return {
             "type": "H2C_UPGRADE",
             "response": data,
             "upgraded": upgraded,
-            "desync_suspected": upgraded,
+            "canary_hit": False,
+            "desync_suspected": False,
+            "needs_escalation": upgraded,
             "raw": request,
         }
 
@@ -71,18 +97,7 @@ class H2CProbe:
             f"\r\n"
             f"{smuggled}"
         ).encode("latin-1", errors="replace")
-
-        try:
-            sock = self._connect()
-            sock.sendall(request)
-            try:
-                data = sock.recv(65535)
-            except OSError:
-                data = None
-            sock.close()
-        except OSError:
-            data = None
-
+        data = self._send_recv(request)
         hit = self.canary.validate(data, canary_path)
         return {
             "type": "H2C_SMUGGLE",
@@ -90,6 +105,7 @@ class H2CProbe:
             "response": data,
             "canary_hit": hit,
             "desync_suspected": hit,
+            "needs_escalation": False,
             "raw": request,
         }
 
@@ -100,5 +116,6 @@ class H2CProbe:
                 results.append(fn(endpoint, host_header))
             except OSError:
                 results.append({"type": fn.__name__, "error": "connection_failed",
-                                "desync_suspected": False})
+                                "desync_suspected": False,
+                                "needs_escalation": False})
         return results
