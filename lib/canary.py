@@ -1,10 +1,70 @@
-"""Canary generation with strict desync verification."""
-
 from random import randint
-from typing import Optional
+from typing import List, Optional
 
 
 CANARY_PREFIX = "canary_"
+MAX_RESPONSES = 16
+
+
+def _parse_status_line(head: bytes) -> Optional[int]:
+    first_line = head.split(b"\r\n", 1)[0]
+    parts = first_line.split(b" ", 2)
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def split_http_responses(blob: bytes) -> List[bytes]:
+    responses: List[bytes] = []
+    remaining = blob
+    while remaining and len(responses) < MAX_RESPONSES:
+        header_end = remaining.find(b"\r\n\r\n")
+        if header_end < 0:
+            responses.append(remaining)
+            break
+        head = remaining[:header_end]
+        body_need = 0
+        chunked = False
+        status = _parse_status_line(head)
+        informational = status is not None and 100 <= status < 200
+        if not informational:
+            for line in head.split(b"\r\n")[1:]:
+                lower = line.lower()
+                if lower.startswith(b"content-length:"):
+                    try:
+                        body_need = int(line.split(b":", 1)[1].strip())
+                    except ValueError:
+                        body_need = 0
+                elif lower.startswith(b"transfer-encoding:") and b"chunked" in lower:
+                    chunked = True
+        if chunked:
+            end = header_end + 4
+            while end < len(remaining):
+                term = remaining.find(b"\r\n", end)
+                if term < 0:
+                    end = len(remaining)
+                    break
+                try:
+                    size = int(remaining[end:term].split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    end = len(remaining)
+                    break
+                end = term + 2 + size + 2
+                if size == 0:
+                    end += 2
+                    break
+            responses.append(remaining[:end])
+            remaining = remaining[end:]
+        else:
+            end = header_end + 4 + body_need
+            if end > len(remaining):
+                end = len(remaining)
+            responses.append(remaining[:end])
+            remaining = remaining[end:]
+    return responses
 
 
 class CanaryGenerator:
@@ -20,28 +80,41 @@ class CanaryGenerator:
     def parse_status(response: bytes) -> Optional[int]:
         if not response:
             return None
-        first_line = response.split(b"\r\n", 1)[0]
-        parts = first_line.split(b" ", 2)
-        if len(parts) < 2:
-            return None
-        try:
-            return int(parts[1])
-        except ValueError:
-            return None
+        return _parse_status_line(response)
 
     @staticmethod
     def validate(response: Optional[bytes], canary_path: str) -> bool:
         if not response:
             return False
         marker = canary_path.encode("latin-1", errors="replace")
-        if marker not in response:
-            return False
-        status = CanaryGenerator.parse_status(response)
-        if status is None:
+        for resp in split_http_responses(response):
+            if not resp or marker not in resp:
+                continue
+            status = CanaryGenerator.parse_status(resp)
+            if status is None:
+                return True
+            if 100 <= status < 200:
+                continue
             return True
-        if 200 <= status < 300:
+        return False
+
+    @staticmethod
+    def validate_strict(response: Optional[bytes], canary_path: str) -> bool:
+        if not response:
             return False
-        return True
+        marker = canary_path.encode("latin-1", errors="replace")
+        for resp in split_http_responses(response):
+            if not resp or marker not in resp:
+                continue
+            status = CanaryGenerator.parse_status(resp)
+            if status is None:
+                return True
+            if 100 <= status < 200:
+                continue
+            if 200 <= status < 300:
+                continue
+            return True
+        return False
 
     @staticmethod
     def validate_differential(response_a: Optional[bytes], response_b: Optional[bytes],
