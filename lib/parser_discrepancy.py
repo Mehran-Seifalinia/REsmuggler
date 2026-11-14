@@ -1,8 +1,8 @@
 from socket import create_connection, socket, timeout as SocketTimeout
 from ssl import CERT_NONE, create_default_context
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
-from lib.canary import CanaryGenerator
+from lib.canary import CanaryGenerator, _parse_status_line
 
 
 DRAIN_TIMEOUT = 0.6
@@ -52,14 +52,8 @@ class ParserDiscrepancyEngine:
     def _status_of(data: bytes) -> int:
         if not data:
             return -1
-        first = data.split(b"\r\n", 1)[0]
-        parts = first.split(b" ", 2)
-        if len(parts) < 2:
-            return -1
-        try:
-            return int(parts[1])
-        except ValueError:
-            return -1
+        status = _parse_status_line(data)
+        return status if status is not None else -1
 
     def _exchange(self, prefix: bytes, victim: bytes) -> Dict[str, object]:
         early = b""
@@ -67,12 +61,13 @@ class ParserDiscrepancyEngine:
         closed_after_prefix = False
         early_status = -1
         victim_status = -1
+        sock = None
         try:
-            sock = self._connect()
-        except OSError:
-            return {"early": b"", "late": b"", "closed_after_prefix": True,
-                    "early_status": -1, "victim_status": -1}
-        try:
+            try:
+                sock = self._connect()
+            except OSError:
+                return {"early": b"", "late": b"", "closed_after_prefix": True,
+                        "early_status": -1, "victim_status": -1}
             try:
                 sock.sendall(prefix)
             except OSError:
@@ -88,10 +83,11 @@ class ParserDiscrepancyEngine:
                 late = self._drain(sock)
                 victim_status = self._status_of(late)
         finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
         return {
             "early": early,
             "late": late,
@@ -189,5 +185,6 @@ class ParserDiscrepancyEngine:
                 results.append(fn(endpoint, host_header))
             except OSError:
                 results.append({"type": fn.__name__, "error": "connection_failed",
-                                "discrepancy": False, "needs_escalation": False})
+                                "discrepancy": False,
+                                "needs_escalation": False})
         return results
