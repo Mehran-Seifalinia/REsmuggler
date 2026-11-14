@@ -1,13 +1,12 @@
-"""HTTP/2 downgrade desync probes with cross-stream canary detection."""
-
 from socket import create_connection, socket
 from ssl import CERT_NONE, create_default_context
 from typing import Dict, List, Optional, Tuple
 
 from h2.config import H2Configuration
 from h2.connection import H2Connection
-from h2.events import (ResponseReceived, DataReceived, StreamEnded,
-                       StreamReset, ConnectionTerminated)
+from h2.events import (ConnectionTerminated, DataReceived, ResponseReceived,
+                       StreamEnded, StreamReset)
+from h2.exceptions import H2Error
 
 from lib.canary import CanaryGenerator
 
@@ -49,15 +48,14 @@ class H2DesyncProbe:
             (":scheme", "https" if self.use_tls else "http"),
             (":authority", authority),
         ]
-        conn.send_headers(stream_id, pseudo + headers, end_stream=not body)
-        if body:
-            conn.send_data(stream_id, body, end_stream=True)
-        sock.sendall(conn.data_to_send())
-
         status: Optional[str] = None
         response_body = b""
         ended = False
         try:
+            conn.send_headers(stream_id, pseudo + headers, end_stream=not body)
+            if body:
+                conn.send_data(stream_id, body, end_stream=True)
+            sock.sendall(conn.data_to_send())
             while not ended:
                 raw = sock.recv(65535)
                 if not raw:
@@ -72,13 +70,14 @@ class H2DesyncProbe:
                         response_body += event.data
                         conn.acknowledge_received_data(
                             event.flow_controlled_length, event.stream_id)
-                    elif isinstance(event, (StreamEnded, StreamReset, ConnectionTerminated)):
+                    elif isinstance(event, (StreamEnded, StreamReset,
+                                            ConnectionTerminated)):
                         if hasattr(event, "stream_id") and event.stream_id != stream_id:
                             continue
                         ended = True
-        except OSError:
+        except (OSError, H2Error):
             pass
-        return {"status": status, "body": response_body}
+        return {"status": status, "body": response_body, "ended": ended}
 
     def _probe(self, path: str, host_header: str, probe_type: str,
                headers: List[Tuple[str, str]], body: bytes,
@@ -93,26 +92,39 @@ class H2DesyncProbe:
             f"# headers = {headers}\n"
             f"# body (raw) = {full_body!r}\n"
         ).encode("latin-1", errors="replace")
+        sock = None
         try:
-            sock, conn = self._connect()
-            self._h2_stream(conn, sock, path, host_header, headers, full_body)
+            try:
+                sock, conn = self._connect()
+            except (OSError, H2Error) as e:
+                return {"type": probe_type, "error": str(e),
+                        "desync_suspected": False, "raw": raw_repr}
+            first_resp = self._h2_stream(conn, sock, path, host_header,
+                                         headers, full_body)
             victim_resp = self._h2_stream(
                 conn, sock, victim_path, host_header,
                 [("content-type", "application/x-www-form-urlencoded")],
                 b"", method="GET",
             )
-            sock.close()
-        except OSError as e:
-            return {"type": probe_type, "error": str(e),
-                    "desync_suspected": False, "raw": raw_repr}
-        victim_body = victim_resp.get("body", b"")
-        hit = self.canary.validate(victim_body, canary_path)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        first_body = first_resp.get("body", b"") or b""
+        victim_body = victim_resp.get("body", b"") or b""
+        first_hit = self.canary.validate(first_body, canary_path)
+        victim_hit = self.canary.validate(victim_body, canary_path)
+        hit = victim_hit and not first_hit
         return {
             "type": probe_type,
             "canary_path": canary_path,
+            "first_status": first_resp.get("status"),
+            "first_hit": first_hit,
             "victim_status": victim_resp.get("status"),
             "victim_body_len": len(victim_body),
-            "canary_hit": hit,
+            "canary_hit": victim_hit,
             "desync_suspected": hit,
             "raw": raw_repr,
         }
@@ -147,7 +159,7 @@ class H2DesyncProbe:
         for fn in (self.probe_h2_cl, self.probe_h2_te, self.probe_h2_crlf):
             try:
                 results.append(fn(path, host_header))
-            except OSError:
+            except (OSError, H2Error):
                 results.append({"type": fn.__name__, "error": "connection_failed",
                                 "desync_suspected": False})
         return results
