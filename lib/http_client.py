@@ -1,7 +1,6 @@
-"""Raw-socket HTTP client with buffered response reading."""
-
-from socket import create_connection, timeout as SocketTimeout, socket
-from ssl import CERT_NONE, create_default_context, HAS_ALPN
+from socket import (HAS_IPV6, create_connection, socket,
+                    timeout as SocketTimeout)
+from ssl import CERT_NONE, HAS_ALPN, create_default_context
 from typing import List, Optional, Tuple
 
 
@@ -10,6 +9,35 @@ RECV_TIMEOUT = 1
 RECV_CLOSED = 2
 
 DEFAULT_MAX_BYTES = 1_048_576
+RECV_CHUNK = 65535
+
+
+def _response_complete(data: bytes) -> bool:
+    if b"\r\n\r\n" not in data:
+        return False
+    head, _, body = data.partition(b"\r\n\r\n")
+    status_line = head.split(b"\r\n", 1)[0]
+    parts = status_line.split(b" ", 2)
+    if len(parts) < 2:
+        return False
+    try:
+        status = int(parts[1])
+    except ValueError:
+        return False
+    if 100 <= status < 200:
+        return False
+    lower_head = head.lower()
+    for line in head.split(b"\r\n")[1:]:
+        lower = line.lower()
+        if lower.startswith(b"content-length:"):
+            try:
+                need = int(line.split(b":", 1)[1].strip())
+            except ValueError:
+                return True
+            return len(body) >= need
+    if b"transfer-encoding:" in lower_head and b"chunked" in lower_head:
+        return body.endswith(b"\r\n0\r\n\r\n") or body.rstrip(b"\r\n") == b"0"
+    return True
 
 
 class HTTPClient:
@@ -46,7 +74,7 @@ class HTTPClient:
         if self._sock is None:
             return RECV_CLOSED, None
         try:
-            data = self._sock.recv(65535)
+            data = self._sock.recv(RECV_CHUNK)
         except SocketTimeout:
             return RECV_TIMEOUT, None
         except OSError:
@@ -60,39 +88,29 @@ class HTTPClient:
             return RECV_CLOSED, None
         chunks: List[bytes] = []
         total = 0
+        closed = False
         while total < max_bytes:
             try:
-                chunk = self._sock.recv(min(65535, max_bytes - total))
+                chunk = self._sock.recv(min(RECV_CHUNK, max_bytes - total))
             except SocketTimeout:
                 break
             except OSError:
+                closed = True
                 break
             if not chunk:
+                closed = True
                 break
             chunks.append(chunk)
             total += len(chunk)
-            if self._looks_complete(b"".join(chunks)):
+            if _response_complete(b"".join(chunks)):
                 break
         if not chunks:
-            return RECV_TIMEOUT, None
+            return (RECV_CLOSED if closed else RECV_TIMEOUT), None
         return RECV_DATA, b"".join(chunks)
 
     @staticmethod
     def _looks_complete(data: bytes) -> bool:
-        if b"\r\n\r\n" not in data:
-            return False
-        head, _, body = data.partition(b"\r\n\r\n")
-        lower_head = head.lower()
-        for line in head.split(b"\r\n")[1:]:
-            if line.lower().startswith(b"content-length:"):
-                try:
-                    need = int(line.split(b":", 1)[1].strip())
-                except ValueError:
-                    return True
-                return len(body) >= need
-        if b"transfer-encoding:" in lower_head and b"chunked" in lower_head:
-            return body.rstrip(b"\r\n").endswith(b"0")
-        return True
+        return _response_complete(data)
 
     def receive_all(self) -> List[bytes]:
         responses = []
